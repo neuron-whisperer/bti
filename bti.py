@@ -1,4 +1,7 @@
-""" bti.py: A script for retrieving documents from the USPTO Bulk Data Storage System. """
+""" bti.py: A script for retrieving documents from the USPTO Bulk Data Storage System.
+
+Version 1.1 (November 11, 2022).
+"""
 
 import argparse, datetime, json, multiprocessing, os, queue, re, ssl, socket, sqlite3
 import sys, time, urllib.request, webbrowser
@@ -20,10 +23,12 @@ class BDSS_Interface:
     parser = argparse.ArgumentParser(description='Retrieves PDFs from the USPTO BDSS repository using the BDSS TAR Index.')
     parser.add_argument('ref', type=str, nargs='?', help='Reference number of patent, publication, or patent application.')
     parser.add_argument('-t', type=str, choices=['patent', 'publication', 'application'], help='Type of reference number ("patent", "publication", or "application").')
+    parser.add_argument('-m', action='store_true', help='Map identifier to other idnetifiers.')
     parser.add_argument('-d', action='store_true', help='Only downloads document; does not open document in default PDF viewer.')
     parser.add_argument('-q', action='store_true', help='Quiet (suppresses console output).')
     args = parser.parse_args()
     ref = vars(args).get('ref', None)
+    map_only = vars(args).get('m', None)
     document_type = vars(args).get('t', None)
     download_only = (vars(args).get('d', False) is True)
     output = (vars(args).get('q', False) is False)
@@ -48,13 +53,21 @@ class BDSS_Interface:
       tk.mainloop()
     else:                     # run command-line process
       cls.print_conditional(output, 'BDSS_Interface written by David Stein (mail@usptodata.com)')
-      result, documents_path = cls.determine_documents_path(output = output)
-      if result is False:
-        return
-      result = cls.fetch(documents_path, ref, document_type, output = output)
-      cls.print_conditional(output, ('Error' if result[0] is False else 'Success') + f': {result[1]}')
-      if result[0] is True and download_only is False:
-        cls.open_document(result[2])
+      if map_only:
+        result = cls.map_identifier(ref, document_type, output)
+        result, message, document_type, application, publication, patent = result
+        if result is False:
+          print(message)
+        else:
+          print(f'{ref} ({document_type}): {application}, {publication}, {patent}')
+      else:
+        result, documents_path = cls.determine_documents_path(output = output)
+        if result is False:
+          return
+        result = cls.fetch(documents_path, ref, document_type, output = output)
+        cls.print_conditional(output, ('Error' if result[0] is False else 'Success') + f': {result[1]}')
+        if result[0] is True and download_only is False:
+          cls.open_document(result[2])
 
   @classmethod
   def fetch(cls, documents_path, ref, document_type = None, output = True):
@@ -121,7 +134,7 @@ class BDSS_Interface:
       cls.print_conditional(output, 'Querying BTI API for BDSS information')
       result = cls.retrieve_ref_from_bti_api(reduced_ref, document_type)
     if result[0] is False:
-      return result
+      return (False, result[1], None)
     reduced_ref, document_type, url, offset, size = result[1:]
     if reduced_ref is None or document_type is None:
       return (False, f'No index entry for {ref}.', None)
@@ -140,8 +153,134 @@ class BDSS_Interface:
     result = cls.retrieve_document_from_bdss(url, offset, size, local_filename)
     return (result[0], result[1], local_filename)
 
+  @classmethod
+  def map_identifier(cls, ref, document_type = None, output = False):
+    database_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'bti.sqlite')
+    if os.path.isfile(database_file):
+      cls.print_conditional(output, 'Mapping identifiers in bti.sqlite')
+      return cls.map_identifier_from_database(ref, document_type)
+    else:
+      cls.print_conditional(output, 'Querying BTI API to map identifiers')
+      return cls.map_identifier_from_bti_api(ref, document_type)
+
   # mid-level task functions
 
+  @classmethod
+  def map_identifier_from_database(cls, ref, document_type = None):
+    """ Maps an identifier to other identifiers using a local BTI database.
+
+        Args:
+          ref (string): The reference identifier.
+          document_type (string, optional): An indicator of the document type - can be
+                "patent," "publication," or "application."
+
+        Returns:
+
+          param1 (bool): An indicator of whether the request succeeded or failed.
+
+          param2 (string):
+            If param1 is True: A regularized version of the identifier.
+            If param1 is False: An error message.
+
+          param3 (string):
+            If param1 is True: An indicator of the document type - can be
+                "patent," "publication," or "application."
+            If param1 is False: None.
+
+          param4 (string):
+            If param1 is True: A patent application number associated with the identifier.
+            If param1 is False: None.
+
+          param5 (int):
+            If param1 is True: A publication number associated with the identifier.
+            If param1 is False: None.
+
+          param6 (int):
+            If param1 is True: A patent number associated with the identifier.
+            If param1 is False: None.
+    """
+
+    database_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'bti.sqlite')
+    result, reduced_ref, document_type = cls.determine_reference_type(ref, document_type)
+    if result is None or document_type is None:
+      return (None, f'Could not determine document type of {ref}.', None, None, None, None)
+
+    application = reduced_ref if document_type == 'application' else None
+    publication = reduced_ref if document_type == 'publication' else None
+    patent = reduced_ref if document_type == 'patent' else None
+    conn = sqlite3.connect(database_file)
+    if document_type == 'application':
+      r1 = conn.execute('select number from publications_fts5 where application_number match ?', (application,)).fetchone()
+      publication = None if r1 is None or len(r1) == 0 else r1[0]
+      r2 = conn.execute('select number from patents_fts5 where application_number match ?', (reduced_ref,)).fetchone()
+      patent = None if r2 is None or len(r2) == 0 else r2[0]
+    elif document_type == 'publication':
+      r1 = conn.execute('select application_number from publications_fts5 where publication match ?', (reduced_ref,)).fetchone()
+      application = None if r1 is None or len(r1) == 0 else r1[0]
+      if application is not None:
+        r2 = conn.execute('select number from patents_fts5 where application_number match ?', (application,)).fetchone()
+        patent = None if r2 is None or len(r2) == 0 else r2[0]
+    elif document_type == 'patent':
+      r1 = conn.execute('select application_number from patents_fts5 where patent match ?', (reduced_ref,)).fetchone()
+      application = None if r1 is None or len(r1) == 0 else r1[0]
+      if r1 is not None:
+        r2 = conn.execute('select number from publications_fts5 where application_number match ?', (application,)).fetchone()
+        publication = None if r2 is None or len(r2) == 0 else r2[0]
+    conn.close()
+    return (True, None, document_type, application, publication, patent)
+
+  @classmethod
+  def map_identifier_from_bti_api(cls, ref, document_type = None):
+    """ Determines the location of a reference within BDSS using a local BTI database.
+
+        Args:
+          ref (string): The reference identifier.
+          document_type (string, optional): An indicator of the document type - can be
+                "patent," "publication," or "application."
+
+        Returns:
+
+          param1 (bool): An indicator of whether the request succeeded or failed.
+
+          param2 (string):
+            If param1 is True: A regularized version of the identifier.
+            If param1 is False: An error message.
+
+          param3 (string):
+            If param1 is True: An indicator of the document type - can be
+                "patent," "publication," or "application."
+            If param1 is False: None.
+
+          param4 (string):
+            If param1 is True: A patent application number associated with the identifier.
+            If param1 is False: None.
+
+          param5 (int):
+            If param1 is True: A publication number associated with the identifier.
+            If param1 is False: None.
+
+          param6 (int):
+            If param1 is True: A patent number associated with the identifier.
+            If param1 is False: None.
+    """
+
+    try:
+      socket.setdefaulttimeout(2)
+      ssl._create_default_https_context = ssl._create_unverified_context
+      timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S%')
+      url = f'https://www.usptodata.com/bti/bti.php?operation=map&ref={ref}&type={document_type}&time={timestamp}'
+      user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.75.14 (KHTML, like Gecko) Version/7.0.3 Safari/7046A194A'
+      request = urllib.request.Request(url, method='GET', headers={'User-Agent': user_agent})
+      with urllib.request.urlopen(request) as request:
+        response = json.loads(request.read())
+        document_type = response.get('type', None)
+        application = response.get('application', None)
+        publication = response.get('publication', None)
+        patent = response.get('patent', None)
+        return (True, None, document_type, application, publication, patent)
+    except Exception as e:
+      return (False, f'Error while querying BTI API: {e}', None, None, None, None)
+    
   @classmethod
   def determine_reference_type(cls, ref, document_type = None):
     """ Determines the type of a reference identifier and returns a regularized
@@ -185,7 +324,7 @@ class BDSS_Interface:
     elif document_type == 'application':
       reduced_ref = cls.format_application_number(reduced_ref, human_readable = False)
     return (False, None, None) if reduced_ref is None else (True, reduced_ref, document_type)
-
+  
   @classmethod
   def retrieve_ref_from_database(cls, ref, document_type):
     """ Determines the location of a reference within BDSS using a local BTI database.
@@ -219,7 +358,6 @@ class BDSS_Interface:
           param6 (int):
             If param1 is True: The size of the document in the .tar file.
             If param1 is False: None.
-
     """
 
     reduced_ref = ref.replace(',', '').replace('/', '')
